@@ -1,0 +1,124 @@
+# Give each run a nice version like 20250809.1
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches: [ main ]
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  azureSubscription: 'AzureConnection-Dev'
+  resourceGroupName: 'SimpleHTMLSite'
+  storageAccountName: 'simplehtmlsite'
+  siteFolder: 'site'                       # folder with index.html
+  artifactBase: 'site'
+  version: '$(Build.BuildNumber)'          # e.g., 20250809.1
+
+steps:
+- checkout: self
+
+# Zip the site for archival
+- task: ArchiveFiles@2
+  displayName: 'Archive site files'
+  inputs:
+    rootFolderOrFile: '$(Build.SourcesDirectory)/$(siteFolder)'
+    includeRootFolder: false
+    archiveType: 'zip'
+    archiveFile: '$(Build.ArtifactStagingDirectory)/$(artifactBase)-$(version).zip'
+    replaceExistingArchive: true
+
+# Publish a versioned artifact (kept forever per retention settings)
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish versioned artifact'
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)/$(artifactBase)-$(version).zip'
+    ArtifactName: '$(artifactBase)-$(version)'
+    publishLocation: 'Container'
+
+# Also publish a "latest" artifact for convenience
+- task: CopyFiles@2
+  displayName: 'Prepare latest artifact'
+  inputs:
+    SourceFolder: '$(Build.ArtifactStagingDirectory)'
+    Contents: '$(artifactBase)-$(version).zip'
+    TargetFolder: '$(Build.ArtifactStagingDirectory)/latest'
+
+- task: PowerShell@2
+  displayName: 'Rename to latest.zip'
+  inputs:
+    targetType: inline
+    script: |
+      Rename-Item `
+        "$(Build.ArtifactStagingDirectory)/latest/$(artifactBase)-$(version).zip" `
+        "latest.zip" -Force
+
+- task: PublishBuildArtifacts@1
+  displayName: 'Publish latest artifact'
+  inputs:
+    PathtoPublish: '$(Build.ArtifactStagingDirectory)/latest'
+    ArtifactName: 'latest'
+    publishLocation: 'Container'
+
+# Deploy: enable static website + upload latest files to $web (public)
+- task: AzureCLI@2
+  displayName: 'Enable static website + upload latest to $web'
+  inputs:
+    azureSubscription: '$(azureSubscription)'
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+      RG='$(resourceGroupName)'
+      ACC='$(storageAccountName)'
+      SRC='$(Build.SourcesDirectory)/$(siteFolder)'
+
+      echo "Enable static website (idempotent)..."
+      az storage blob service-properties update \
+        --account-name "$ACC" \
+        --static-website true \
+        --index-document index.html \
+        --404-document error.html
+
+      echo "Get account key..."
+      KEY=$(az storage account keys list -g "$RG" -n "$ACC" --query "[0].value" -o tsv)
+
+      echo "Upload latest to \$web..."
+      az storage blob upload-batch \
+        --account-name "$ACC" \
+        --account-key "$KEY" \
+        --destination '$web' \
+        --source "$SRC" \
+        --overwrite
+
+# (Optional) Keep a copy of each release in Storage (private history)
+- task: AzureCLI@2
+  displayName: 'Upload versioned copy to releases/<buildnumber>/'
+  inputs:
+    azureSubscription: '$(azureSubscription)'
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+      set -euo pipefail
+      RG='$(resourceGroupName)'
+      ACC='$(storageAccountName)'
+      SRC='$(Build.SourcesDirectory)/$(siteFolder)'
+      VER='$(version)'
+
+      KEY=$(az storage account keys list -g "$RG" -n "$ACC" --query "[0].value" -o tsv)
+
+      echo "Ensure 'releases' container exists..."
+      az storage container create \
+        --name 'releases' \
+        --account-name "$ACC" \
+        --account-key "$KEY" \
+        --public-access off 1>/dev/null
+
+      echo "Upload versioned copy to releases/$VER/..."
+      az storage blob upload-batch \
+        --account-name "$ACC" \
+        --account-key "$KEY" \
+        --destination 'releases' \
+        --destination-path "$VER" \
+        --source "$SRC" \
+        --overwrite
